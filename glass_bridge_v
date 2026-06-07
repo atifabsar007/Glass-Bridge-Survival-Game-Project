@@ -1,0 +1,496 @@
+module glass_bridge(
+    input clk,              // 100MHz clock
+    input rst,              // Reset button
+    input btn_start,        // Center button to start
+    input btn_step,         // Up button to move to next row
+    input [15:0] sw,        // Switches for glass selection
+    output reg [15:0] led,  // LEDs to show glass pattern
+    output reg [6:0] seg,   // 7-segment display
+    output reg [3:0] an     // 7-segment anodes
+);
+
+    // State machine states
+    localparam IDLE = 3'd0;
+    localparam GEN_BRIDGE = 3'd1;
+    localparam SHOW_PATTERN = 3'd2;
+    localparam WAIT_INPUT = 3'd3;
+    localparam CHECK_CHOICE = 3'd4;
+    localparam WIN = 3'd5;
+    localparam LOSE = 3'd6;
+    
+    // Stage parameters
+    localparam STAGE1_ROWS = 10;
+    localparam STAGE1_COLS = 2;
+    localparam STAGE2_ROWS = 10;
+    localparam STAGE2_COLS = 3;
+    localparam STAGE3_ROWS = 15;
+    localparam STAGE3_COLS = 7;
+    localparam STAGE4_ROWS = 15;
+    localparam STAGE4_COLS = 12;
+    
+    reg [2:0] state;
+    reg [3:0] stage;        // Current stage (1-4)
+    reg [4:0] current_row;  // Current row in bridge
+    reg [4:0] total_rows;   // Total rows for current stage
+    reg [4:0] num_cols;     // Number of columns for current stage
+    reg [4:0] display_row;  // Row being displayed
+    
+    // Bridge matrix storage (max 15 rows x 12 cols)
+    reg [11:0] bridge [0:14];
+    
+    // Bridge generation variables
+    reg [4:0] gen_row;
+    reg [4:0] gen_col;
+    reg [4:0] gen_count;
+    reg [6:0] gen_threshold;
+    
+    // Timing counters
+    reg [31:0] timer;
+    reg [31:0] display_time;
+    reg [31:0] off_time;
+    
+    // Button debouncing
+    reg [19:0] btn_start_counter;
+    reg [19:0] btn_step_counter;
+    reg btn_start_pressed;
+    reg btn_step_pressed;
+    reg btn_start_prev;
+    reg btn_step_prev;
+    reg btn_start_sync, btn_step_sync, rst_sync;
+    reg btn_start_sync2, btn_step_sync2, rst_sync2;
+    
+    // LFSR for pseudo-random generation
+    reg [31:0] lfsr;
+    wire lfsr_feedback;
+    assign lfsr_feedback = lfsr[31] ^ lfsr[21] ^ lfsr[1] ^ lfsr[0];
+    
+    // 7-segment display
+    reg [3:0] display_digit;
+    reg [1:0] digit_select;
+    reg [16:0] digit_counter;
+    
+    // Choice validation
+    reg choice_valid;
+    
+    // Synchronize button inputs (prevent metastability)
+    always @(posedge clk) begin
+        btn_start_sync <= btn_start;
+        btn_start_sync2 <= btn_start_sync;
+        btn_step_sync <= btn_step;
+        btn_step_sync2 <= btn_step_sync;
+        rst_sync <= rst;
+        rst_sync2 <= rst_sync;
+    end
+    
+    // Initialize
+    integer init_i;
+    initial begin
+        state = IDLE;
+        stage = 1;
+        lfsr = 32'hACE1FACE;
+        current_row = 0;
+        display_row = 0;
+        timer = 0;
+        led = 16'h0000;
+        btn_start_pressed = 0;
+        btn_step_pressed = 0;
+        btn_start_prev = 0;
+        btn_step_prev = 0;
+        digit_select = 0;
+        digit_counter = 0;
+        total_rows = 10;
+        num_cols = 2;
+        display_time = 32'd100_000_000;
+        off_time = 32'd50_000_000;
+        gen_row = 0;
+        gen_col = 0;
+        gen_count = 0;
+        gen_threshold = 50;
+        choice_valid = 0;
+        for (init_i = 0; init_i < 15; init_i = init_i + 1) begin
+            bridge[init_i] = 12'b0;
+        end
+    end
+    
+    // Button debouncing and edge detection
+    always @(posedge clk) begin
+        if (rst_sync2) begin
+            btn_start_counter <= 0;
+            btn_step_counter <= 0;
+            btn_start_pressed <= 0;
+            btn_step_pressed <= 0;
+            btn_start_prev <= 0;
+            btn_step_prev <= 0;
+        end else begin
+            // Start button
+            btn_start_prev <= btn_start_sync2;
+            if (btn_start_sync2 && !btn_start_prev) begin
+                btn_start_counter <= 0;
+                btn_start_pressed <= 0;
+            end else if (btn_start_sync2 && btn_start_prev) begin
+                if (btn_start_counter < 20'd500000) begin
+                    btn_start_counter <= btn_start_counter + 1;
+                end else if (!btn_start_pressed) begin
+                    btn_start_pressed <= 1;
+                end
+            end else begin
+                btn_start_counter <= 0;
+                btn_start_pressed <= 0;
+            end
+            
+            // Step button
+            btn_step_prev <= btn_step_sync2;
+            if (btn_step_sync2 && !btn_step_prev) begin
+                btn_step_counter <= 0;
+                btn_step_pressed <= 0;
+            end else if (btn_step_sync2 && btn_step_prev) begin
+                if (btn_step_counter < 20'd500000) begin
+                    btn_step_counter <= btn_step_counter + 1;
+                end else if (!btn_step_pressed) begin
+                    btn_step_pressed <= 1;
+                end
+            end else begin
+                btn_step_counter <= 0;
+                btn_step_pressed <= 0;
+            end
+        end
+    end
+    
+    // LFSR for random number generation
+    always @(posedge clk) begin
+        if (rst_sync2)
+            lfsr <= 32'hACE1FACE;
+        else
+            lfsr <= {lfsr[30:0], lfsr_feedback};
+    end
+    
+    // Check if player's choice is valid
+    always @(*) begin
+        choice_valid = 0;
+        case (num_cols)
+            2: begin
+                if ((sw[0] && bridge[current_row][0]) || 
+                    (sw[1] && bridge[current_row][1]))
+                    choice_valid = 1;
+            end
+            3: begin
+                if ((sw[0] && bridge[current_row][0]) || 
+                    (sw[1] && bridge[current_row][1]) ||
+                    (sw[2] && bridge[current_row][2]))
+                    choice_valid = 1;
+            end
+            7: begin
+                if ((sw[0] && bridge[current_row][0]) || 
+                    (sw[1] && bridge[current_row][1]) ||
+                    (sw[2] && bridge[current_row][2]) ||
+                    (sw[3] && bridge[current_row][3]) ||
+                    (sw[4] && bridge[current_row][4]) ||
+                    (sw[5] && bridge[current_row][5]) ||
+                    (sw[6] && bridge[current_row][6]))
+                    choice_valid = 1;
+            end
+            12: begin
+                if ((sw[0] && bridge[current_row][0]) || 
+                    (sw[1] && bridge[current_row][1]) ||
+                    (sw[2] && bridge[current_row][2]) ||
+                    (sw[3] && bridge[current_row][3]) ||
+                    (sw[4] && bridge[current_row][4]) ||
+                    (sw[5] && bridge[current_row][5]) ||
+                    (sw[6] && bridge[current_row][6]) ||
+                    (sw[7] && bridge[current_row][7]) ||
+                    (sw[8] && bridge[current_row][8]) ||
+                    (sw[9] && bridge[current_row][9]) ||
+                    (sw[10] && bridge[current_row][10]) ||
+                    (sw[11] && bridge[current_row][11]))
+                    choice_valid = 1;
+            end
+            default: choice_valid = 0;
+        endcase
+    end
+    
+    // Main state machine
+    always @(posedge clk) begin
+        if (rst_sync2) begin
+            state <= IDLE;
+            stage <= 1;
+            current_row <= 0;
+            display_row <= 0;
+            timer <= 0;
+            led <= 16'h0000;
+            gen_row <= 0;
+            gen_col <= 0;
+        end else begin
+            case (state)
+                IDLE: begin
+                    led <= 16'h0000;
+                    current_row <= 0;
+                    display_row <= 0;
+                    gen_row <= 0;
+                    gen_col <= 0;
+                    timer <= 0;
+                    
+                    if (btn_start_pressed) begin
+                        // Set stage parameters
+                        case (stage)
+                            1: begin
+                                total_rows <= STAGE1_ROWS;
+                                num_cols <= STAGE1_COLS;
+                                display_time <= 32'd100_000_000; // 1s
+                                off_time <= 32'd50_000_000;      // 0.5s
+                                gen_threshold <= 50;
+                            end
+                            2: begin
+                                total_rows <= STAGE2_ROWS;
+                                num_cols <= STAGE2_COLS;
+                                display_time <= 32'd75_000_000;  // 0.75s
+                                off_time <= 32'd37_500_000;      // 0.375s
+                                gen_threshold <= 40;
+                            end
+                            3: begin
+                                total_rows <= STAGE3_ROWS;
+                                num_cols <= STAGE3_COLS;
+                                display_time <= 32'd50_000_000;  // 0.5s
+                                off_time <= 32'd25_000_000;      // 0.25s
+                                gen_threshold <= 30;
+                            end
+                            4: begin
+                                total_rows <= STAGE4_ROWS;
+                                num_cols <= STAGE4_COLS;
+                                display_time <= 32'd30_000_000;  // 0.3s
+                                off_time <= 32'd15_000_000;      // 0.15s
+                                gen_threshold <= 25;
+                            end
+                            default: begin
+                                total_rows <= STAGE1_ROWS;
+                                num_cols <= STAGE1_COLS;
+                                display_time <= 32'd100_000_000;
+                                off_time <= 32'd50_000_000;
+                                gen_threshold <= 50;
+                            end
+                        endcase
+                        
+                        state <= GEN_BRIDGE;
+                    end
+                end
+                
+                GEN_BRIDGE: begin
+                    // Generate bridge sequentially
+                    if (gen_col == 0) begin
+                        bridge[gen_row] <= 12'b0;
+                        gen_count <= 0;
+                    end
+                    
+                    if (gen_col < num_cols) begin
+                        // Generate random value
+                        if ((lfsr[7:0] % 100) < gen_threshold || 
+                            (gen_count == 0 && gen_col == num_cols - 1)) begin
+                            bridge[gen_row][gen_col] <= 1'b1;
+                            gen_count <= gen_count + 1;
+                        end else begin
+                            bridge[gen_row][gen_col] <= 1'b0;
+                        end
+                        gen_col <= gen_col + 1;
+                    end else begin
+                        gen_col <= 0;
+                        if (gen_row < total_rows - 1) begin
+                            gen_row <= gen_row + 1;
+                        end else begin
+                            gen_row <= 0;
+                            timer <= 0;
+                            state <= SHOW_PATTERN;
+                        end
+                    end
+                end
+                
+                SHOW_PATTERN: begin
+                    timer <= timer + 1;
+                    
+                    if (timer < display_time) begin
+                        // Show current row pattern on LEDs (right-aligned)
+                        case (num_cols)
+                            2: led <= {{14{1'b0}}, bridge[display_row][1:0]};
+                            3: led <= {{13{1'b0}}, bridge[display_row][2:0]};
+                            7: led <= {{9{1'b0}}, bridge[display_row][6:0]};
+                            12: led <= {{4{1'b0}}, bridge[display_row][11:0]};
+                            default: led <= 16'h0000;
+                        endcase
+                    end else if (timer < display_time + off_time) begin
+                        // LEDs off between rows
+                        led <= 16'h0000;
+                    end else begin
+                        timer <= 0;
+                        if (display_row < total_rows - 1) begin
+                            display_row <= display_row + 1;
+                        end else begin
+                            led <= 16'h0000;
+                            display_row <= 0;
+                            timer <= 0;
+                            state <= WAIT_INPUT;
+                        end
+                    end
+                end
+                
+                WAIT_INPUT: begin
+                    timer <= timer + 1;
+                    // Blink LED at current row position (slower blink)
+                    if (current_row < 16) begin
+                        if (timer[25])  // Slower blink using bit 25
+                            led <= 16'h0001 << current_row;
+                        else
+                            led <= 16'h0000;
+                    end else begin
+                        led <= 16'h0000;
+                    end
+                    
+                    if (btn_step_pressed) begin
+                        timer <= 0;
+                        state <= CHECK_CHOICE;
+                    end
+                end
+                
+                CHECK_CHOICE: begin
+                    timer <= timer + 1;
+                    
+                    if (timer < 32'd50_000_000) begin
+                        // Show feedback for 0.5 seconds
+                        if (choice_valid)
+                            led <= 16'hFFFF;  // All on for correct
+                        else
+                            led <= 16'h0000;  // All off for wrong
+                    end else begin
+                        timer <= 0;
+                        if (choice_valid) begin
+                            // Correct choice
+                            if (current_row >= total_rows - 1) begin
+                                // Won the stage!
+                                state <= WIN;
+                            end else begin
+                                // Move to next row
+                                current_row <= current_row + 1;
+                                state <= WAIT_INPUT;
+                            end
+                        end else begin
+                            // Wrong choice - game over
+                            state <= LOSE;
+                        end
+                    end
+                end
+                
+                WIN: begin
+                    timer <= timer + 1;
+                    // Flash all LEDs
+                    if (timer[24])
+                        led <= 16'hFFFF;
+                    else
+                        led <= 16'h0000;
+                    
+                    if (btn_start_pressed) begin
+                        if (stage < 4)
+                            stage <= stage + 1;
+                        else
+                            stage <= 1;
+                        timer <= 0;
+                        state <= IDLE;
+                    end
+                end
+                
+                LOSE: begin
+                    timer <= timer + 1;
+                    // Flash alternating pattern
+                    if (timer[24])
+                        led <= 16'hAAAA;
+                    else
+                        led <= 16'h5555;
+                    
+                    if (btn_start_pressed) begin
+                        stage <= 1;
+                        timer <= 0;
+                        state <= IDLE;
+                    end
+                end
+                
+                default: state <= IDLE;
+            endcase
+        end
+    end
+    
+    // 7-segment display multiplexing
+    always @(posedge clk) begin
+        if (rst_sync2) begin
+            digit_counter <= 0;
+            digit_select <= 0;
+        end else begin
+            if (digit_counter < 17'd100000) begin
+                digit_counter <= digit_counter + 1;
+            end else begin
+                digit_counter <= 0;
+                digit_select <= digit_select + 1;
+            end
+        end
+    end
+    
+    // Display digit selection and 7-seg decoding
+    always @(*) begin
+        // Default values
+        display_digit = 4'd0;
+        an = 4'b1111;
+        seg = 7'b1111111;
+        
+        case (state)
+            IDLE: begin
+                // Show "000X" where X is stage number
+                case (digit_select)
+                    2'd0: display_digit = stage;   // Rightmost: stage number
+                    2'd1: display_digit = 4'd0;
+                    2'd2: display_digit = 4'd0;
+                    2'd3: display_digit = 4'd0;    // Leftmost
+                    default: display_digit = 4'd0;
+                endcase
+            end
+            GEN_BRIDGE: begin
+                // Show "----" or "GEN"
+                display_digit = 4'd15;  // All segments off
+            end
+            SHOW_PATTERN, WAIT_INPUT, CHECK_CHOICE: begin
+                // Show "XXYY" where XX=current row+1, YY=total rows
+                case (digit_select)
+                    2'd0: display_digit = total_rows % 10;           // Rightmost: total ones
+                    2'd1: display_digit = total_rows / 10;           // total tens
+                    2'd2: display_digit = (current_row + 1) % 10;    // current ones
+                    2'd3: display_digit = (current_row + 1) / 10;    // Leftmost: current tens
+                    default: display_digit = 4'd0;
+                endcase
+            end
+            WIN: begin
+                display_digit = 4'd9;  // All show "9"
+            end
+            LOSE: begin
+                display_digit = 4'd0;  // All show "0"
+            end
+            default: begin
+                display_digit = 4'd15; // Blank
+            end
+        endcase
+        
+        // Anode control (active low) - enable current digit
+        an = 4'b1111;
+        an[digit_select] = 1'b0;
+        
+        // 7-segment decoder (common anode - active LOW)
+        // Segments: GFEDCBA (bit 6 to bit 0)
+        case (display_digit)
+            4'd0: seg = 7'b1000000; // 0
+            4'd1: seg = 7'b1111001; // 1
+            4'd2: seg = 7'b0100100; // 2
+            4'd3: seg = 7'b0110000; // 3
+            4'd4: seg = 7'b0011001; // 4
+            4'd5: seg = 7'b0010010; // 5
+            4'd6: seg = 7'b0000010; // 6
+            4'd7: seg = 7'b1111000; // 7
+            4'd8: seg = 7'b0000000; // 8
+            4'd9: seg = 7'b0010000; // 9
+            default: seg = 7'b1111111; // All off (blank)
+        endcase
+    end
+
+endmodule
