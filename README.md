@@ -135,7 +135,7 @@ This project was developed as part of the **Digital Logic Design Laboratory** co
 
 ## Author
 
-**Md Atif Absar** & **Agomon Das Dhrubo**
+**Md. Atif Absar** & **Agomon Das Dhrubo**
 Computer Science & Engineering (CSE)
 Khulna University of Engineering & Technology (KUET)
 
